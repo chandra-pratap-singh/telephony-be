@@ -1,3 +1,4 @@
+require("dotenv").config();
 const express = require("express");
 const fs = require("fs");
 const cors = require("cors");
@@ -10,18 +11,49 @@ const path = require("path");
 const app = express();
 app.use(
   cors({
-    origin: "http://localhost:5173",
+    origin: "*",
     methods: ["GET", "POST"],
     credentials: true,
   })
 );
 
+// On your Node.js server (e.g., server.js)
+const twilio = require("twilio");
+
+// Use environment variables to store your credentials securely
+const accountSid = process.env.TWILIO_ACCOUNT_SID;
+const authToken = process.env.TWILIO_AUTH_TOKEN;
+
+// Create a Twilio client
+const client = twilio(accountSid, authToken);
+
+// Create an endpoint for your client-side app to call
+app.get("/get-turn-credentials", async (req, res) => {
+  try {
+    console.log("Request received for TURN credentials.");
+
+    // Use the Twilio REST API to fetch temporary STUN/TURN credentials
+    // The TTL (Time-To-Live) is in seconds. 2 hours is a reasonable default.
+    const token = await client.tokens.create({ ttl: 3600 * 2 });
+
+    // The token object contains an `iceServers` array with all the STUN and TURN server configurations.
+    console.log("Successfully fetched TURN credentials from Twilio.");
+    res.json({ iceServers: token.iceServers });
+  } catch (error) {
+    console.error("Failed to fetch TURN credentials from Twilio:", error);
+    res.status(500).send("Failed to get TURN credentials.");
+  }
+});
+
 app.get("/", (req, res) => res.send("hello world"));
+
+// ... your other server logic ...
+// app.listen(3001, () => console.log('Server running on port 3001'));
 
 const server = http.createServer(app);
 const io = new Server(server, {
   cors: {
-    origin: "http://localhost:5173",
+    origin: "*",
     methods: ["GET", "POST"],
     credentials: true,
   },
