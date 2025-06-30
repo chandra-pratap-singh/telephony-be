@@ -1,162 +1,246 @@
 require("dotenv").config();
 const express = require("express");
-const fs = require("fs");
+const fs = require("fs").promises;
+const path = require("path");
 const cors = require("cors");
 const http = require("http");
 const { Server } = require("socket.io");
 const { spawn } = require("child_process");
 const ffmpegPath = require("ffmpeg-static");
-const path = require("path");
-
-const app = express();
-app.use(
-  cors({
-    origin: "*",
-    methods: ["GET", "POST"],
-    credentials: true,
-  })
-);
-
-// On your Node.js server (e.g., server.js)
 const twilio = require("twilio");
 
-// Use environment variables to store your credentials securely
+// --- Configuration ---
+const PORT = process.env.PORT || 3000;
+const RECORDINGS_DIR = path.join(__dirname, "recordings");
+const app = express();
+const server = http.createServer(app);
+
+// --- Security: CORS Configuration ---
+const corsOptions = {
+  origin: "*",
+  methods: ["GET", "POST"],
+  credentials: true,
+};
+app.use(cors(corsOptions));
+
+// --- API Route for TURN Credentials ---
 const accountSid = process.env.TWILIO_ACCOUNT_SID;
 const authToken = process.env.TWILIO_AUTH_TOKEN;
 
-// Create a Twilio client
+if (!accountSid || !authToken) {
+  console.error(" Twilio credentials are not set in the .env file.");
+  process.exit(1);
+}
 const client = twilio(accountSid, authToken);
 
-// Create an endpoint for your client-side app to call
 app.get("/get-turn-credentials", async (req, res) => {
   try {
-    console.log("Request received for TURN credentials.");
-
-    // Use the Twilio REST API to fetch temporary STUN/TURN credentials
-    // The TTL (Time-To-Live) is in seconds. 2 hours is a reasonable default.
-    const token = await client.tokens.create({ ttl: 3600 * 2 });
-
-    // The token object contains an `iceServers` array with all the STUN and TURN server configurations.
-    console.log("Successfully fetched TURN credentials from Twilio.");
+    const token = await client.tokens.create({ ttl: 7200 }); // 2-hour TTL
     res.json({ iceServers: token.iceServers });
   } catch (error) {
-    console.error("Failed to fetch TURN credentials from Twilio:", error);
-    res.status(500).send("Failed to get TURN credentials.");
+    console.error("Failed to fetch TURN credentials:", error);
+    res.status(500).json({ error: "Failed to get TURN credentials." });
   }
 });
 
-app.get("/", (req, res) => res.send("hello world"));
+// --- Socket.IO Server Setup ---
+const io = new Server(server, { cors: corsOptions });
 
-// ... your other server logic ...
-// app.listen(3001, () => console.log('Server running on port 3001'));
+// --- Helper Functions ---
 
-const server = http.createServer(app);
-const io = new Server(server, {
-  cors: {
-    origin: "*",
-    methods: ["GET", "POST"],
-    credentials: true,
-  },
-});
+/**
+ * Converts a WebM recording to a WAV file using the specified codec.
+ * @param {string} inputPath - Path to the input .webm file.
+ * @param {string} codec - The audio codec to use (e.g., 'pcm_mulaw').
+ * @returns {Promise<string>} A promise that resolves with the path to the new .wav file.
+ */
+// In your convertToWav function...
+const convertToWav = (inputPath, codec) => {
+  return new Promise((resolve, reject) => {
+    const outputPath = inputPath.replace(".webm", `-${codec}.wav`);
+    const ffmpeg = spawn(ffmpegPath, [
+      "-y",
+      "-i",
+      inputPath,
+      // ✅ Add this flag to suppress informational logs
+      "-loglevel",
+      "error",
+      "-ar",
+      "8000",
+      "-ac",
+      "1",
+      "-c:a",
+      codec,
+      outputPath,
+    ]);
 
-const fileStreams = {};
+    // This will now only catch true errors
+    let errorOutput = "";
+    ffmpeg.stderr.on("data", (data) => {
+      errorOutput += data.toString();
+    });
 
-io.on("connection", (socket) => {
-  console.log(`🔌 User connected: ${socket.id}`);
+    ffmpeg.on("close", (code) => {
+      if (code === 0) {
+        resolve(outputPath);
+      } else {
+        reject(`FFmpeg exited with code ${code}\n\nError:\n${errorOutput}`);
+      }
+    });
+    ffmpeg.on("error", (err) => reject(err));
+  });
+};
 
+/**
+ * Gracefully finalizes a recording session for a given room.
+ * @param {import("socket.io").Socket} socket - The socket instance for the user.
+ * @param {string} roomId - The room ID of the recording to finalize.
+ */
+const finalizeRecording = async (socket, roomId) => {
+  const recordingState = socket.recordings?.get(roomId);
+  if (!recordingState) return;
+
+  const { fileStream, webmPath } = recordingState;
+  console.log(
+    `[${socket.id}] Finalizing recording for room ${roomId} at ${webmPath}`
+  );
+
+  await new Promise((resolve) => fileStream.end(resolve));
+
+  try {
+    const finalWavPath = await convertToWav(webmPath, "pcm_mulaw");
+    console.log(
+      `[${socket.id}]  Conversion successful. Final file: ${finalWavPath}`
+    );
+    // Optional: Delete the temporary .webm file
+    // await fs.unlink(webmPath);
+  } catch (error) {
+    console.error(`[${socket.id}]  Conversion failed for ${webmPath}:`, error);
+  } finally {
+    socket.recordings.delete(roomId);
+    console.log(
+      `[${socket.id}] Cleaned up recording state for room ${roomId}.`
+    );
+  }
+};
+
+// --- Socket Event Handlers Setup ---
+
+/**
+ * Sets up all WebRTC signaling event listeners for a socket.
+ * @param {import("socket.io").Socket} socket
+ */
+const setupSignalingHandlers = (socket) => {
   socket.on("join-room", (roomId) => {
     socket.join(roomId);
-    console.log(`User ${socket.id} joined room ${roomId}`);
+    console.log(`[${socket.id}] joined room ${roomId}`);
     socket.to(roomId).emit("new-peer", socket.id);
   });
 
-  socket.on("call-offer", (offer, roomId) => {
-    socket.to(roomId).emit("call-offer", offer);
-  });
+  socket.on("call-offer", (offer, roomId) =>
+    socket.to(roomId).emit("call-offer", offer)
+  );
+  socket.on("call-answer", (answer, roomId) =>
+    socket.to(roomId).emit("call-answer", answer)
+  );
+  socket.on("ice-candidate", (candidate, roomId) =>
+    socket.to(roomId).emit("ice-candidate", candidate)
+  );
+};
 
-  socket.on("call-answer", (answer, roomId) => {
-    socket.to(roomId).emit("call-answer", answer);
-  });
-
-  socket.on("ice-candidate", (candidate, roomId) => {
-    socket.to(roomId).emit("ice-candidate", candidate);
-  });
-
-  socket.on("audio-chunk", (blob) => {
-    const dir = "recordings";
-    const webmPath = path.join(dir, `audio-${socket.id}.webm`);
-
-    if (!fileStreams[socket.id]) {
-      if (!fs.existsSync(dir)) fs.mkdirSync(dir);
-      fileStreams[socket.id] = fs.createWriteStream(webmPath);
-      console.log(`🎙️ Started recording: ${webmPath}`);
-    }
-
-    fileStreams[socket.id].write(Buffer.from(blob));
-  });
-
-  socket.on("recording-done", () => {
-    const webmPath = `recordings/audio-${socket.id}.webm`;
-    const wavPath = `recordings/audio-${socket.id}.wav`;
-
-    const writer = fileStreams[socket.id];
-    if (!writer) return;
-
-    writer.end(() => {
-      console.log(
-        `🛑 Finished recording for ${socket.id}, converting to WAV...`
+/**
+ * Sets up all recording-related event listeners for a socket.
+ * @param {import("socket.io").Socket} socket
+ */
+const setupRecordingHandlers = (socket) => {
+  socket.on("start-recording", async (roomId) => {
+    if (!roomId)
+      return console.error(
+        `[${socket.id}] 'start-recording' event missing roomId.`
       );
+    console.log(" 🎙️ Recording started for room", roomId);
+    if (socket.recordings.has(roomId)) await finalizeRecording(socket, roomId);
 
-      const gsmPath = `recordings/audio-${socket.id}.gsm`;
-      const alawWavPath = `recordings/audio-${socket.id}-alaw.wav`;
-      const mulawWavPath = `recordings/audio-${socket.id}-mulaw.wav`;
-
-      const ffmpeg = spawn(ffmpegPath, [
-        "-y",
-        "-i",
-        webmPath,
-        "-ar",
-        "8000",
-        "-ac",
-        "1",
-        "-c:a",
-        "pcm_mulaw", // Mu-Law codec
-        mulawWavPath, // output: e.g., recordings/audio-xxx-mulaw.wav
-      ]);
-
-      ffmpeg.stderr.on("data", (data) => {
-        console.error("FFmpeg error:", data.toString());
-      });
-
-      ffmpeg.on("close", (code) => {
-        if (code === 0) {
-          console.log(`✅ WAV file saved: ${alawWavPath}`);
-        } else {
-          console.error(`❌ FFmpeg exited with code ${code}`);
-        }
-      });
-    });
-
-    delete fileStreams[socket.id];
+    const webmPath = path.join(
+      RECORDINGS_DIR,
+      `audio-${roomId}-${Date.now()}.webm`
+    );
+    try {
+      await fs.mkdir(RECORDINGS_DIR, { recursive: true });
+      const fileStream = require("fs").createWriteStream(webmPath);
+      socket.recordings.set(roomId, { fileStream, webmPath, roomId });
+      console.log(
+        `[${socket.id}] Created filestream for room ${roomId}: ${webmPath}`
+      );
+    } catch (err) {
+      console.error(
+        `[${socket.id}] Failed to create filestream for room ${roomId}:`,
+        err
+      );
+      socket.emit(
+        "recording-error",
+        `Failed to start recording for room ${roomId}.`
+      );
+    }
   });
 
-  socket.on("disconnect", () => {
-    console.log(`❌ User disconnected: ${socket.id}`);
-    const writer = fileStreams[socket.id];
-    if (writer) {
-      writer.end();
-      delete fileStreams[socket.id];
-      console.log(`🧹 Cleaned up writer for ${socket.id}`);
+  socket.on("audio-chunk", (blob, roomId) => {
+    try {
+      const recordingState = socket.recordings.get(roomId);
+      recordingState?.fileStream.write(Buffer.from(blob));
+    } catch (error) {
+      console.error(
+        `[${socket.id}] Failed to write audio chunk for room ${roomId}:`,
+        error
+      );
+    }
+  });
+
+  socket.on("recording-done", (roomId) => {
+    if (socket.recordings.has(roomId)) {
+      finalizeRecording(socket, roomId);
+    }
+  });
+};
+
+/**
+ * Sets up the disconnect logic for a socket.
+ * @param {import("socket.io").Socket} socket
+ */
+const setupDisconnectHandler = (socket) => {
+  socket.on("disconnect", async () => {
+    console.log(`User disconnected: ${socket.id}`);
+
+    if (socket.recordings.size > 0) {
+      console.log(
+        `[${socket.id}] Disconnected with ${socket.recordings.size} active recording(s). Finalizing all...`
+      );
+      const finalizationPromises = Array.from(socket.recordings.keys()).map(
+        (roomId) => finalizeRecording(socket, roomId)
+      );
+      await Promise.all(finalizationPromises);
     }
 
-    socket.rooms.forEach((roomId) => {
-      if (roomId !== socket.id) {
-        socket.to(roomId).emit("peer-disconnected", socket.id);
-      }
+    const rooms = [...socket.rooms].filter((room) => room !== socket.id);
+    rooms.forEach((roomId) => {
+      socket.to(roomId).emit("peer-disconnected", socket.id);
     });
   });
+};
+
+// --- Main Connection Logic ---
+io.on("connection", (socket) => {
+  console.log(`User connected: ${socket.id}`);
+
+  // Each socket gets its own Map to manage multiple recordings.
+  socket.recordings = new Map();
+
+  setupSignalingHandlers(socket);
+  setupRecordingHandlers(socket);
+  setupDisconnectHandler(socket);
 });
 
-server.listen(3000, () => {
-  console.log("🚀 Server running on http://localhost:3000");
+// --- Start Server ---
+server.listen(PORT, () => {
+  console.log(`Server running on http://localhost:${PORT}`);
 });
