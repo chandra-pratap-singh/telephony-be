@@ -1,5 +1,6 @@
 require("dotenv").config();
 const express = require("express");
+const f = require("fs");
 const fs = require("fs").promises;
 const path = require("path");
 const cors = require("cors");
@@ -13,6 +14,7 @@ const twilio = require("twilio");
 const PORT = process.env.PORT || 3000;
 const RECORDINGS_DIR = path.join(__dirname, "recordings");
 const app = express();
+
 const server = http.createServer(app);
 
 // --- Security: CORS Configuration ---
@@ -44,7 +46,7 @@ app.get("/get-turn-credentials", async (req, res) => {
 });
 
 // --- Socket.IO Server Setup ---
-const io = new Server(server, { cors: corsOptions });
+const io = new Server(server, { cors: corsOptions, addTrailingSlash: false });
 
 // --- Helper Functions ---
 
@@ -131,10 +133,48 @@ const finalizeRecording = async (socket, roomId) => {
  * @param {import("socket.io").Socket} socket
  */
 const setupSignalingHandlers = (socket) => {
+  const makeOffer = (roomId) => {
+    const clientsInRoom = io.sockets.adapter.rooms.get(roomId);
+    console.log("clientsInRoom: ", clientsInRoom.size);
+    if (clientsInRoom.size === 2) {
+      const socketIds = [...clientsInRoom];
+      const caller = socketIds[0] > socketIds[1] ? socketIds[0] : socketIds[1];
+      io.to(caller).emit("make-offer", socket.id);
+      console.log("emitted make-offer to caller: ", caller);
+    }
+  };
   socket.on("join-room", (roomId) => {
     socket.join(roomId);
     console.log(`[${socket.id}] joined room ${roomId}`);
-    socket.to(roomId).emit("new-peer", socket.id);
+    makeOffer(roomId);
+  });
+
+  socket.on("negotiation-needed", (roomId) => {
+    console.log(
+      "negotiation-needed event received for roomId: ",
+      roomId,
+      socket.id
+    );
+    makeOffer(roomId);
+  });
+
+  socket.on("end-call", (roomId) => {
+    socket.to(roomId).emit("end-call", socket.id);
+  });
+
+  socket.on("retry-call", (roomId) => {
+    console.log("retry call event received for rommId: ", roomId);
+    io.to(roomId).emit("peer-disconnected", socket.id);
+    console.log("emited peer disconnect and scheduled set timeout");
+    setTimeout(() => {
+      const clients = io.sockets.adapter.rooms.get(roomId);
+      if (clients.size === 2) {
+        const clientsArray = Array.from(clients);
+        const firstClientSocketId = clientsArray[0];
+        console.log("emitting new peer to ", firstClientSocketId);
+        io.to(firstClientSocketId).emit("new-peer");
+      }
+    }, 1000);
   });
 
   socket.on("call-offer", (offer, roomId) =>
@@ -172,6 +212,7 @@ const setupRecordingHandlers = (socket) => {
       console.log(
         `[${socket.id}] Created filestream for room ${roomId}: ${webmPath}`
       );
+      io.to(roomId).emit("recording-started");
     } catch (err) {
       console.error(
         `[${socket.id}] Failed to create filestream for room ${roomId}:`,
@@ -185,21 +226,15 @@ const setupRecordingHandlers = (socket) => {
   });
 
   socket.on("audio-chunk", (blob, roomId) => {
-    try {
-      const recordingState = socket.recordings.get(roomId);
-      recordingState?.fileStream.write(Buffer.from(blob));
-    } catch (error) {
-      console.error(
-        `[${socket.id}] Failed to write audio chunk for room ${roomId}:`,
-        error
-      );
-    }
+    const recordingState = socket.recordings.get(roomId);
+    recordingState?.fileStream.write(Buffer.from(blob));
   });
 
   socket.on("recording-done", (roomId) => {
     if (socket.recordings.has(roomId)) {
       finalizeRecording(socket, roomId);
     }
+    io.to(roomId).emit("recording-stopped");
   });
 };
 
@@ -208,7 +243,7 @@ const setupRecordingHandlers = (socket) => {
  * @param {import("socket.io").Socket} socket
  */
 const setupDisconnectHandler = (socket) => {
-  socket.on("disconnect", async () => {
+  socket.on("disconnecting", async () => {
     console.log(`User disconnected: ${socket.id}`);
 
     if (socket.recordings.size > 0) {
@@ -220,9 +255,11 @@ const setupDisconnectHandler = (socket) => {
       );
       await Promise.all(finalizationPromises);
     }
-
+    console.log("unfiltere rooms ", socket.rooms);
     const rooms = [...socket.rooms].filter((room) => room !== socket.id);
+    console.log("rooms: ", rooms);
     rooms.forEach((roomId) => {
+      console.log("emitting peer diosconnect to roomId: ", roomId);
       socket.to(roomId).emit("peer-disconnected", socket.id);
     });
   });
